@@ -1418,6 +1418,40 @@ export default ({
       },
     },
     {
+      title: 'Border Radius with "overflow: hidden"',
+      name: 'border-radius-overflow-hidden',
+      render(): React.Node {
+        return (
+          <View testID="view-test-border" style={{rowGap: 10}}>
+              <View
+                style={{
+                  borderRadius: 24,
+                  overflow: 'hidden',
+                  borderWidth: 2,
+                  borderColor: 'black',
+                }}>
+                <RNTesterText style={{fontSize: 12, padding: 10, backgroundColor: 'lightblue'}}>
+                  borderBlockColor orange
+                </RNTesterText>
+              </View>
+              <View
+              style={{
+                borderTopLeftRadius: 24,
+                borderTopRightRadius: 24,
+                borderBottomLeftRadius: 24,
+                overflow: 'hidden',
+                borderWidth: 2,
+                borderColor: 'black',
+              }}>
+              <RNTesterText style={{fontSize: 12, padding: 10, backgroundColor: 'lightblue'}}>
+                borderBlockColor orange
+              </RNTesterText>
+            </View>
+          </View>
+        );
+      },
+    },
+    {
       title: 'Box Shadow',
       name: 'box-shadow',
       render: BoxShadowExample,
