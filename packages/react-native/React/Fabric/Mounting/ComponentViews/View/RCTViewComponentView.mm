@@ -1149,7 +1149,7 @@ static RCTBorderStyle RCTBorderStyleFromOutlineStyle(OutlineStyle outlineStyle)
       }
 
       for (UIView *subview in self.currentContainerView.subviews) {
-        if ([subview isKindOfClass:[UIImageView class]]) {
+        if ([subview isKindOfClass:[UIImageView class]] || _borderLayer != nil) {
           RCTCornerInsets cornerInsets = RCTGetCornerInsets(
               RCTCornerRadiiFromBorderRadii(borderMetrics.borderRadii),
               RCTUIEdgeInsetsFromEdgeInsets(borderMetrics.borderWidths));
