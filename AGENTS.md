@@ -71,3 +71,7 @@ Never hand-edit generated output — change the source and regenerate. CI valida
 - In the test plan, give the exact commands you ran and their results, plus screenshots or a video for user-interface changes. Say which checks you could not run.
 
 The full process is on [reactnative.dev](https://reactnative.dev/contributing/overview).
+
+## Agent docs
+
+- [docs/agents/index.md](docs/agents/index.md): read before exploring the list and virtualization code (FlatList, SectionList, VirtualizedList, viewability, maintainVisibleContentPosition, VirtualView, VirtualColumn/VirtualRow). Architecture, area map, where to look, usage and extension, contributing. Covers only that subsystem. Generated from an earlier commit; verify details against the code.

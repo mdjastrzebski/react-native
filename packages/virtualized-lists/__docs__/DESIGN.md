@@ -95,24 +95,24 @@ across all platforms.
 - Detects prepends by comparing `firstVisibleItemKey` across renders
 - Computes `maintainVisibleContentPositionAdjustment` (prepend delta in item
   count)
-- Increments `pendingScrollUpdateCount` to suppress render window updates
+- Sets `pendingScrollUpdateCount` to `1` to suppress render window updates
 - Adjusts `cellsAroundViewport` render window by the adjustment amount
 
 **Key state field:** `pendingScrollUpdateCount` — dual-purpose:
 
 1. Initial scroll index tracking (set to `1` when `initialScrollIndex > 0`)
-2. MVCP adjustment tracking (incremented on prepend detection, decremented on
-   scroll events)
+2. MVCP adjustment tracking (set to `1` on prepend detection, reset to `0` on
+   the next scroll event)
 
 **Detection flow (in `getDerivedStateFromProps`):**
 
 ```js
-// When maintainVisibleContentPosition != null:
+// When maintainVisibleContentPosition != null and the item count changed:
 if (firstVisibleItemKey changed between renders) {
     // Item was prepended — find where the previous anchor is now
     newAdjustment = firstVisibleItemIndex - minIndexForVisible
     cellsAroundViewport shifted by adjustment
-    pendingScrollUpdateCount++
+    pendingScrollUpdateCount = 1
 }
 ```
 
@@ -122,15 +122,16 @@ if (firstVisibleItemKey changed between renders) {
   `pendingScrollUpdateCount > 0`, preventing render window updates during MVCP
   corrections
 - `_maybeCallOnEdgeReached`: Suppresses edge callbacks while
-  `pendingScrollUpdateCount > 0`
+  `pendingScrollUpdateCount > 0` (`_updateViewableItems` is gated the same way)
 
 #### 3.1.2 ScrollView (`packages/react-native/Libraries/Components/ScrollView/ScrollView.js`)
 
 **Responsibilities:**
 
 - Passes `maintainVisibleContentPosition` prop through to native component
-- Sets `collapsableChildren = true` when MVCP is active, preventing React from
-  collapsing/merging child views — critical for stable native view references
+- Sets `collapsableChildren={false}` on the content container when MVCP is
+  active (via `preserveChildren`), so Fabric does not flatten its children —
+  critical for stable native view references
 
 **Prop type:**
 
@@ -175,12 +176,12 @@ maintainVisibleContentPosition?: ?{
 
 **State variables:**
 
-| Variable                                            | Type              | Purpose                                    |
-| --------------------------------------------------- | ----------------- | ------------------------------------------ |
-| `_prevFirstVisibleFrame`                            | `CGRect`          | Captured frame of anchor before mount      |
-| `_firstVisibleView`                                 | `__weak UIView *` | Reference to current first visible subview |
-| `_firstVisibleViewTag`                              | `NSInteger`       | Tag for recycle detection                  |
-| `_avoidAdjustmentForMaintainVisibleContentPosition` | `BOOL`            | Skip gate for immediate update mode        |
+| Variable                                            | Type              | Purpose                                                                                                             |
+| --------------------------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `_prevFirstVisibleFrame`                            | `CGRect`          | Captured frame of anchor before mount                                                                               |
+| `_firstVisibleView`                                 | `__weak UIView *` | Reference to current first visible subview                                                                          |
+| `_firstVisibleViewTag`                              | `NSInteger`       | Tag for recycle detection                                                                                           |
+| `_avoidAdjustmentForMaintainVisibleContentPosition` | `BOOL`            | Skip gate set to `enableImmediateUpdateModeForContentOffsetChanges` only while `_updateStateWithContentOffset` runs |
 
 **Tag comparison safeguard:**
 
@@ -201,8 +202,8 @@ if (_firstVisibleView.tag != _firstVisibleViewTag) {
 **Status:** Always active. `RCTComponentViewRegistry` assigns tags during
 dequeue (`componentViewDescriptor.view.tag = tag`) and resets to 0 during
 enqueue (`componentViewDescriptor.view.tag = 0`). When items are removed and
-re-added, recycled UIViews get new tags based on their position. The view at
-position 0 may have a different tag than before, so the check must always run.
+re-added, recycled UIViews get the React tag of the new ShadowView they now
+host, so the check must always run.
 
 #### 3.2.2 RCTComponentViewRegistry (`RCTComponentViewRegistry.mm`)
 
@@ -223,7 +224,11 @@ position 0 may have a different tag than before, so the check must always run.
 internal class MaintainVisibleScrollPositionHelper<ScrollViewT>(
     private val scrollView: ScrollViewT,
     private val horizontal: Boolean,
-) : UIManagerListener where ScrollViewT : HasSmoothScroll?, ScrollViewT : ViewGroup?
+) : UIManagerListener
+    where
+        ScrollViewT : HasScrollEventThrottle?,
+        ScrollViewT : HasSmoothScroll?,
+        ScrollViewT : ViewGroup?
 ```
 
 **State variables:**
@@ -233,13 +238,13 @@ internal class MaintainVisibleScrollPositionHelper<ScrollViewT>(
 | `config`                | `Config?`              | MVCP configuration                             |
 | `firstVisibleViewRef`   | `WeakReference<View>?` | Anchor view reference (auto-nullifies if GC'd) |
 | `prevFirstVisibleFrame` | `Rect?`                | Captured frame of anchor                       |
-| `isListening`           | `boolean`              | Whether listener is active                     |
+| `isListening`           | `Boolean`              | Whether listener is active                     |
 
 **Lifecycle callbacks:**
 
-- `willDispatchViewUpdates` — calls `computeTargetView()` (pre-layout, first
-  capture)
-- `willMountItems` — calls `computeTargetView()` (pre-layout, second capture)
+- `willDispatchViewUpdates` — Paper-only `UIManagerListener` callback; never
+  invoked under Fabric
+- `willMountItems` — calls `computeTargetView()` (pre-layout capture)
 - `didMountItems` — calls `updateScrollPositionInternal()`
 
 **`computeTargetView`:**
@@ -256,16 +261,15 @@ internal class MaintainVisibleScrollPositionHelper<ScrollViewT>(
 - Computes delta on `left` (horizontal) or `top` (vertical) coordinates
 - `scrollToPreservingMomentum()`
 - Updates `prevFirstVisibleFrame` to new frame after correction
-- Calls `emitScrollEventNoThrottle()` to ensure JS state is current
 - Early return if `firstVisibleViewRef.get()` is null (view GC'd)
 - **Threshold:** Uses `delta != 0` (vs iOS `ABS(delta) > 0.5`)
 
-#### 3.3.2 ReactScrollView (`ReactScrollView.java`)
+#### 3.3.2 ReactScrollView (`ReactScrollView.kt`)
 
 **MVCP field:**
 
-```java
-private @Nullable MaintainVisibleScrollPositionHelper mMaintainVisibleContentPositionHelper;
+```kotlin
+private var maintainVisibleContentPositionHelper: MaintainVisibleScrollPositionHelper<ReactScrollView>? = null
 ```
 
 **`setMaintainVisibleContentPosition`:**
@@ -273,10 +277,10 @@ private @Nullable MaintainVisibleScrollPositionHelper mMaintainVisibleContentPos
 - `config != null && helper == null`: creates new helper with
   `horizontal = false`, calls `start()`
 - `config == null && helper != null`: calls `stop()`, sets helper to `null`
-- Helper exists: updates config via `setConfig()`
+- Helper exists: updates its `config`
 
 **`horizontal` flag:** Hardcoded to `false` — `ReactScrollView` only supports
-vertical scrolling.
+vertical scrolling (`ReactHorizontalScrollView` passes `true`).
 
 **Lifecycle integration:**
 
@@ -354,22 +358,18 @@ RCTMountingManager.performTransaction:
 #### 4.1.2 Android Event Flow
 
 ```text
-SurfaceMountingManager.onBatchComplete:
+MountItemDispatcher.dispatchMountItems:
   |
-  +-- UIManagerImplementationExecutor.notifyWillDispatchViewUpdates
-  |      -> MaintainVisibleScrollPositionHelper.willDispatchViewUpdates
-  |         -> computeTargetView() [pre-layout, first capture]
-  |
-  +-- UIManagerImplementationExecutor.notifyWillMountItems
+  +-- FabricUIManager.MountItemDispatchListener.willMountItems
   |      -> MaintainVisibleScrollPositionHelper.willMountItems
-  |         -> computeTargetView() [pre-layout, second capture, overwrites first]
+  |         -> computeTargetView() [pre-layout capture]
   |
   +-- View mount / layout updates
   |      Children added/removed from contentView
   |      UPDATE_LAYOUT: view.measure() + view.layout() — frames set here
   |      Culling: off-screen children removed from children (kept in allChildren)
   |
-  +-- UIManagerImplementationExecutor.notifyDidMountItems
+  +-- FabricUIManager.MountItemDispatchListener.didMountItems
   |      -> MaintainVisibleScrollPositionHelper.didMountItems
   |         -> updateScrollPositionInternal()
   |            -> firstVisibleView = firstVisibleViewRef.get()
@@ -377,7 +377,6 @@ SurfaceMountingManager.onBatchComplete:
   |            ->    delta = firstVisibleView.frame - prevFirstVisibleFrame
   |            ->    if delta != 0: scrollToPreservingMomentum(currentScroll + delta)
   |            ->    Update prevFirstVisibleFrame to new frame
-  |            ->    emitScrollEventNoThrottle()
 ```
 
 ### 4.2 Scroll Events
@@ -386,18 +385,21 @@ SurfaceMountingManager.onBatchComplete:
 
 ```js
 if (this.state.pendingScrollUpdateCount > 0) {
-  this.setState({pendingScrollUpdateCount: state.pendingScrollUpdateCount - 1});
+  this.setState({pendingScrollUpdateCount: 0});
 }
 ```
 
-Each scroll event decrements `pendingScrollUpdateCount`. When it reaches 0,
-render window updates resume and edge callbacks are re-enabled.
+Any scroll event resets `pendingScrollUpdateCount` to 0, after which render
+window updates resume and edge callbacks are re-enabled. It is reset rather than
+decremented because native `onScroll` events are coalesced
+(`dispatchUniqueEvent`), so N native corrections can arrive in JS as a single
+event (commit `5cb65244dc5`).
 
 ### 4.3 Observer Registration Lifecycle
 
 | Platform   | Registration Trigger                                                                  | Deregistration Trigger                                               |
 | ---------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| iOS Fabric | `mountingTransactionWillMount` callback (automatic via observer coordinator)          | `mountingTransactionDidMount` callback                               |
+| iOS Fabric | Create mutation (`RCTMountingTransactionObserverCoordinator`, for every scroll view)  | Delete mutation                                                      |
 | Android    | `setMaintainVisibleContentPosition:` config != null (creates helper, calls `start()`) | `setMaintainVisibleContentPosition:` config == null (calls `stop()`) |
 
 ---
@@ -417,7 +419,7 @@ VirtualizedList detects firstVisibleItemKey changed
   |
   v
 JS computes adjustment = 1 (one item prepended above minIndexForVisible)
-JS increments pendingScrollUpdateCount
+JS sets pendingScrollUpdateCount = 1
 JS shifts cellsAroundViewport by 1
   |
   v
@@ -436,7 +438,7 @@ Native: Anchor stays at same screen position (550 - 550 = 0, top of viewport)
   |
   v
 Next cycle's WILL_MOUNT: Recompute anchor for next correction
-JS: Scroll event fires -> pendingScrollUpdateCount decrements
+JS: Scroll event fires -> pendingScrollUpdateCount reset to 0
 JS: Render window updates resume
 ```
 
@@ -497,28 +499,26 @@ contentOffset += 50
 ```
 
 **Bug scenario when anchor is recycled:** If the anchor view itself happens to
-be recycled (deleted and recreated with a new tag), the tag comparison detects
+be recycled (deleted, then reused with a new tag), the tag comparison detects
 the mismatch and aborts the correction. The next batch will recompute and
 correct from fresh data.
 
 > **Important:** The tag check is **always active** (no feature flag gate).
 > `RCTComponentViewRegistry` assigns tags during dequeue and resets to 0 during
-> enqueue. When items are removed and re-added, recycled UIViews get new tags
-> based on their position. The view at position 0 may have a different tag than
-> before, so the check must always run. This was confirmed by the
-> `flatlist-inverted-recycle-maintainvisible` maestro test, which failed when
-> the tag check was gated behind `enableViewCulling()` (which returns false in
-> RNTester).
+> enqueue. When items are removed and re-added, recycled UIViews get the React
+> tag of the new ShadowView they now host, so the check must always run. This
+> was confirmed by the `flatlist-inverted-recycle-maintainvisible` maestro test,
+> which failed when the tag check was gated behind `enableViewCulling()` (which
+> returns false in RNTester).
 
 ### 5.4 Empty List / Data Reset
 
-**iOS Fabric (minor bug):** When the list becomes empty,
-`_prepareForMaintainVisibleScrollPosition` doesn't execute (loop doesn't run),
-leaving `_firstVisibleView` unchanged. When
-`_adjustForMaintainVisibleContentPosition` runs, it accesses
-`_firstVisibleView.frame` — in Objective-C, accessing `.frame` on nil returns
-`{0,0}`, so `deltaY = 0 - _prevFirstVisibleFrame.origin.y` causes an incorrect
-scroll correction.
+**iOS Fabric (safe):** When the list becomes empty,
+`_prepareForMaintainVisibleScrollPosition` finds no candidate (its loop body
+doesn't run), leaving the previous `_firstVisibleView` in place.
+`_adjustForMaintainVisibleContentPosition` then aborts: the nil check catches a
+deallocated anchor, and the tag check catches one that was deleted (tag reset
+to 0) or recycled.
 
 **Android (safe):** `updateScrollPositionInternal` checks
 `firstVisibleViewRef.get() ?: return` — early return if view is null. No
@@ -564,8 +564,8 @@ purposes:
    preventing render window updates until a valid scroll offset is received from
    native.
 
-2. **MVCP adjustment tracking:** Incremented when a prepend is detected
-   (JS-side), decremented on each scroll event. While > 0:
+2. **MVCP adjustment tracking:** Set to `1` when a prepend is detected
+   (JS-side), reset to `0` on the next scroll event. While > 0:
    - `_adjustCellsAroundViewport` returns early (no render window updates)
    - `_maybeCallOnEdgeReached` is suppressed (edge callbacks don't fire on stale
      metrics)
@@ -606,7 +606,7 @@ if (_firstVisibleView.tag != _firstVisibleViewTag) {
   and assigns new tags (`componentViewDescriptor.view.tag = tag`), or resets
   tags to 0 during enqueue
 - When items are removed and re-added, the same UIView objects may be reused for
-  different items with new tags
+  different items with new tags (the React tag of the ShadowView they now host)
 - `_adjustForMaintainVisibleContentPosition` compares the current tag with the
   captured tag
 - If tags differ → view was recycled → abort correction (avoids applying delta
@@ -614,9 +614,8 @@ if (_firstVisibleView.tag != _firstVisibleViewTag) {
 
 **Why the check is always active:** `RCTComponentViewRegistry` assigns tags
 during dequeue and resets to 0 during enqueue, regardless of culling state. When
-items are removed and re-added, recycled UIViews get new tags based on their
-position. The view at position 0 may have a different tag than before, so the
-check must always run.
+items are removed and re-added, recycled UIViews get the React tag of the new
+ShadowView they now host, so the check must always run.
 
 **Impact:** When the anchor view is recycled, MVCP correctly aborts and waits
 for the next batch to recompute from fresh data. Without this check, MVCP would
@@ -624,8 +623,10 @@ apply an incorrect delta to the wrong view, producing incorrect scroll offsets.
 
 ### 7.2 Deletion Check (iOS Fabric)
 
-**Purpose:** Detect when the anchor view was deleted (removed from hierarchy)
-during mount, e.g., during `setData([])` + `scrollToOffset(0)` reset.
+**Purpose:** Detect when the anchor view was removed from `_contentView` during
+mount without being deleted (e.g. reparented). Deleted anchors, such as during a
+`setData([])` + `scrollToOffset(0)` reset, are already caught by the tag check,
+because every Delete enqueues the view and resets its tag to 0.
 
 **Implementation:**
 
@@ -637,8 +638,8 @@ if (_firstVisibleView.superview != _contentView) {
 
 **When it triggers:**
 
-- `setData([])` clears all items → anchor view removed from `_contentView`
-- `_firstVisibleView.superview` becomes nil
+- Anchor view removed from `_contentView` by a Remove mutation that is not
+  followed by a Delete
 - `_firstVisibleView.superview != _contentView` → abort
 
 **Why it's needed:** Without this check, MVCP would compute a delta from the
@@ -651,23 +652,24 @@ offset (e.g., offset ~3876 instead of 0).
 | -------------------- | ------------ | ------------------ | ----------------- | ------------------------ |
 | Normal prepend       | No           | No                 | False             | False → **proceed**      |
 | View recycled        | Yes          | No                 | True → **abort**  | -                        |
-| View deleted (reset) | No           | Yes                | False             | True → **abort**         |
+| View deleted (reset) | Yes (→ 0)    | Yes                | True → **abort**  | -                        |
+| View reparented      | No           | Yes                | False             | True → **abort**         |
 
-Recycling and deletion are mutually exclusive:
-
-- Recycling: view reused for different item → tag changes, superview unchanged
-- Deletion: view removed from hierarchy → tag unchanged, superview becomes nil
+Deletion resets the tag to 0, so deleted or recycled anchors are caught by the
+tag check. The superview check catches an anchor that was removed from
+`_contentView` but not deleted.
 
 ### 7.3 Scroll Skip Guards
 
 **Purpose:** Skip MVCP correction during user dragging or momentum scroll to
 avoid conflicting with user gestures.
 
-**Current status:** | Platform | Scroll Skip Guard |
-|----------|------------------| | iOS Fabric | **Not present** in MVCP code.
-`_avoidAdjustmentForMaintainVisibleContentPosition` is driven by a feature flag
-for immediate update mode, not scroll state. | | Android | **Not present**. No
-scroll skip guard in `updateScrollPositionInternal`. |
+**Current status:**
+
+| Platform   | Scroll Skip Guard                                                                                                                                                             |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| iOS Fabric | **Not present** in MVCP code. `_avoidAdjustmentForMaintainVisibleContentPosition` is driven by the `enableImmediateUpdateModeForContentOffsetChanges` flag, not scroll state. |
+| Android    | **Not present**. No scroll skip guard in `updateScrollPositionInternal`.                                                                                                      |
 
 ### 7.4 Divide-by-Zero Guard (JS)
 
@@ -689,10 +691,10 @@ corrupting new measurements.
 
 ### 7.5 Empty List Handling
 
-| Platform   | Behavior                                                                            |
-| ---------- | ----------------------------------------------------------------------------------- |
-| iOS Fabric | Minor bug: nil `.frame` access returns `{0,0}`, causing incorrect scroll correction |
-| Android    | Safe: `firstVisibleViewRef.get() ?: return` early return                            |
+| Platform   | Behavior                                                 |
+| ---------- | -------------------------------------------------------- |
+| iOS Fabric | Safe: nil / tag / superview checks abort the correction  |
+| Android    | Safe: `firstVisibleViewRef.get() ?: return` early return |
 
 ### 7.6 Frame Delta Threshold
 
@@ -709,17 +711,16 @@ corrections. The threshold filters out floating-point rounding errors. iOS uses
 
 **Prop:** `autoscrollToTopThreshold` (optional, number)
 
-**Behavior:** When the scroll offset after MVCP correction is within the
-threshold distance from the top (offset < threshold), the list animates to the
-start position. This handles the case where prepending pushes content entirely
-off the top of the screen.
+**Behavior:** When a correction is applied and the scroll offset _before_ the
+correction was `<= autoscrollToTopThreshold`, the list then animates to the
+start, so a user who was at the top sees the newly prepended items.
 
 ### 7.8 Scroll Event Throttle (Android)
 
 **The throttle mechanism:**
 
 ```kotlin
-if (scrollEventType == SCROLL &&
+if (!skipThrottle && scrollEventType == SCROLL &&
     scrollView.scrollEventThrottle >= max(17, now - scrollView.lastScrollDispatchTime)) {
     return  // throttled
 }
@@ -737,23 +738,21 @@ to be stale:
 - Result: JS offset is stale when MVCP computes delta
 
 **Fix:** Added `emitScrollEventNoThrottle()` that bypasses the throttle check,
-called in two places:
-
-1. **After scroll animations end** (`registerFlingAnimator.onAnimationEnd`):
-   Ensures JS state is updated immediately when animation completes.
-
-2. **After MVCP adjustments** (`MaintainVisibleScrollPositionHelper`): Ensures
-   JS state reflects MVCP-adjusted position immediately.
+called when a fling animation finishes (`registerFlingAnimator`, in both
+`onAnimationEnd` and `onAnimationCancel`). This ensures JS state is updated
+immediately when the animation completes. The MVCP correction itself
+(`scrollToPreservingMomentum`) goes through the normal, throttled scroll event
+path.
 
 **Why this is correct:**
 
 - Throttle still applies during active scrolling (reduces traffic as intended)
-- Unthrottled events only fire after animations end or MVCP adjusts position
+- Unthrottled events only fire after fling animations end or are cancelled
 - JS state is current when needed for delta calculations
 
-**Platform difference:** iOS uses UIScrollViewDelegate callbacks that don't
-apply the same throttle to programmatic scrolls. Android's ReactScrollView
-applies throttle uniformly to all events.
+**Platform difference:** iOS throttles all `scrollViewDidScroll:` events too,
+but MVCP calls `_forceDispatchNextScrollEvent` before changing `contentOffset`,
+so the adjusted offset is always emitted.
 
 ---
 
@@ -792,8 +791,8 @@ to handle views that are no longer valid anchors:
    during enqueue, so a tag mismatch means the view no longer represents the
    same item.
 3. **Superview check** (`_firstVisibleView.superview != _contentView`): Detects
-   when the anchor view was removed from the scroll view's hierarchy (e.g.,
-   during a data reset).
+   when the anchor view was removed from the scroll view's hierarchy without
+   being deleted (a deleted view already fails the tag check).
 
 **Ordering rationale:** The nil check is first (cheapest, catches empty list).
 The tag check is second (catches recycling). The superview check is last
@@ -802,8 +801,8 @@ case (normal prepend where all three pass).
 
 **Why the tag check is always active:** `RCTComponentViewRegistry` assigns tags
 during dequeue and resets to 0 during enqueue regardless of culling state. When
-items are removed and re-added (even without culling), recycled UIViews can
-receive new tags based on their new position. The tag check must always run to
+items are removed and re-added (even without culling), recycled UIViews receive
+the React tag of the new ShadowView they host. The tag check must always run to
 avoid applying a delta to the wrong view.
 
 ### 8.3 Android — Scroll Event Throttle Design
@@ -814,22 +813,15 @@ occur during or immediately after a scroll animation may find stale JS offset
 state if the throttle blocks the adjustment event.
 
 **Resolution: selective unthrottling.** The `emitScrollEventNoThrottle()`
-function bypasses the throttle check but is only called in two specific places:
-after scroll animations end, and after MVCP adjustments. This preserves the
-throttle's purpose (reducing JS bridge traffic during active scrolling) while
-ensuring JS state is current when needed for delta calculations.
+function bypasses the throttle check but is only called when a fling animation
+ends or is cancelled (`registerFlingAnimator`). This preserves the throttle's
+purpose (reducing JS bridge traffic during active scrolling) while ensuring JS
+state is current once a scroll animation completes. MVCP corrections themselves
+are emitted through the normal throttled path.
 
-**Why two call sites are needed:** The animation-end call site ensures JS state
-is updated when a user-initiated scroll animation completes (preventing stale
-state for subsequent MVCP corrections). The MVCP call site ensures JS state
-reflects the MVCP-adjusted position immediately (preventing stale delta
-calculations). Both are needed because MVCP corrections can happen independently
-of scroll animations (e.g., during data updates).
-
-**Platform difference:** iOS uses UIScrollViewDelegate callbacks that don't
-apply the same throttle to programmatic scrolls. Android's ReactScrollView
-applies throttle uniformly to all events, which is why this design detail is
-specific to Android.
+**Platform difference:** iOS throttles `scrollViewDidScroll:` events as well,
+but MVCP calls `_forceDispatchNextScrollEvent` before adjusting `contentOffset`,
+so the corrected offset is always dispatched.
 
 ---
 
@@ -845,7 +837,7 @@ specific to Android.
 | `RCTScrollViewComponentView.mm` | `_adjustForMaintainVisibleContentPosition` — delta computation + correction          |
 | `RCTComponentViewRegistry.mm`   | Recycle pool max size constant (1024)                                                |
 | `RCTComponentViewRegistry.mm`   | `_dequeueComponentViewWithComponentHandle` — pool dequeue                            |
-| `RCTComponentViewRegistry.mm`   | `_enqueueComponentViewWithComponentView` — pool enqueue                              |
+| `RCTComponentViewRegistry.mm`   | `_enqueueComponentViewWithComponentHandle:componentViewDescriptor:` — pool enqueue   |
 | `RCTMountingManager.mm`         | `performTransaction` — three-phase mount lifecycle                                   |
 
 ### Android
@@ -856,8 +848,8 @@ specific to Android.
 | `MaintainVisibleScrollPositionHelper.kt` | `updateScrollPositionInternal` — correction logic                     |
 | `MaintainVisibleScrollPositionHelper.kt` | `computeTargetView` — anchor scan with WeakReference                  |
 | `MaintainVisibleScrollPositionHelper.kt` | `willMountItems` / `didMountItems` — UIManagerListener callbacks      |
-| `ReactScrollView.java`                   | `mMaintainVisibleContentPositionHelper` field                         |
-| `ReactScrollView.java`                   | `setMaintainVisibleContentPosition` — helper creation/update/teardown |
+| `ReactScrollView.kt`                     | `maintainVisibleContentPositionHelper` field                          |
+| `ReactScrollView.kt`                     | `setMaintainVisibleContentPosition` — helper creation/update/teardown |
 | `ReactViewGroup.kt`                      | Culling state (\_removeClippedSubviews, allChildren, clippingRect)    |
 | `ReactViewGroup.kt`                      | `updateClippingToRect` — culling implementation                       |
 
